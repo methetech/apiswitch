@@ -14,7 +14,7 @@ Windows/macOS/Linux. ASCII-only strings.
 """
 
 from __future__ import annotations
-import json, os, platform, re, shutil, subprocess, sys, threading
+import json, os, platform, re, shutil, subprocess, sys, threading, time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import tkinter as tk
@@ -125,6 +125,7 @@ if is_windows():
                 HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment",
                 SMTO_ABORTIFHUNG, 5000, ctypes.byref(wintypes.DWORD())
             )
+            time.sleep(0.05) # Give explorer a moment to react
         except Exception: pass
     try: import winreg  # type: ignore
     except Exception: winreg = None
@@ -376,6 +377,7 @@ def clear_environment_variables() -> list[str]:
         "GOOGLE_API_KEY",
         "GEMINI_API_KEY",
         "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_PROJECT_ID",
         "GCLOUD_PROJECT",
         "PROJECT_ID",
         "PROJECT_NUMBER",
@@ -448,9 +450,48 @@ def ensure_gcloud_configuration(p: Profile, safe_revoke: bool) -> str:
 
     return "\n".join([x for x in logs if x])
 
+def apply_single_variable(var_name: str, var_value: str, use_machine_env: bool) -> str:
+    logs: list[str] = []
+    env_values_to_set = {var_name: var_value}
+    if var_name in ("GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT", "PROJECT_ID"):
+        env_values_to_set["GOOGLE_CLOUD_PROJECT"] = var_value
+        env_values_to_set["GOOGLE_CLOUD_PROJECT_ID"] = var_value
+        env_values_to_set["GCLOUD_PROJECT"] = var_value
+        env_values_to_set["PROJECT_ID"] = var_value
+        logs.append(f"Recognized {var_name} as a project ID alias; setting all related variables.")
+
+    if is_windows():
+        for var, val in env_values_to_set.items():
+            try:
+                windows_set_env(var, val or "", machine=use_machine_env)
+                logs.append(f"Set {var} ({'machine' if use_machine_env else 'user'})")
+            except Exception as e:
+                logs.append(f"env set failed for {var}: {e}")
+    else:
+        current_vars = {}
+        if ENV_FILE.exists():
+            try:
+                txt = ENV_FILE.read_text(encoding="utf-8")
+                for line in txt.splitlines():
+                    match = re.match(r"^\s*export\s+([^=]+)='(.*)'\s*$", line)
+                    if match:
+                        key = match.group(1)
+                        if key not in env_values_to_set:
+                            current_vars[key] = match.group(2)
+            except Exception as e:
+                logs.append(f"Failed to read existing env file: {e}")
+        for var, val in env_values_to_set.items():
+            current_vars[var] = val or ""
+        ensure_env_file(current_vars)
+        ensure_shell_rc_sources_env()
+        logs.append("Updated POSIX env file and ensured shell rc sources it.")
+    return "\n".join([x for x in logs if x])
+
 # ---------------------------- Apply / Analyze ----------------------------
 def apply_profile(p: Profile, use_machine_env: bool, safe_revoke: bool, add_gcloud_to_path: bool) -> str:
-    p = p.normalized(); logs: list[str] = []
+    p = p.normalized()
+    logs: list[str] = clear_environment_variables()
+
 
     # Resolve ID/number if only one present
     if p.gcloud_project and not p.gcloud_project_number:
@@ -463,9 +504,10 @@ def apply_profile(p: Profile, use_machine_env: bool, safe_revoke: bool, add_gclo
         if pnum: p.gcloud_project_number = pnum
 
     env_values = {
-        "GOOGLE_API_KEY": p.google_api_key or p.gemini_api_key,
-        "GEMINI_API_KEY": p.gemini_api_key or p.google_api_key,
+        "GOOGLE_API_KEY": p.google_api_key,
+        "GEMINI_API_KEY": p.gemini_api_key,
         "GOOGLE_CLOUD_PROJECT": p.gcloud_project,
+        "GOOGLE_CLOUD_PROJECT_ID": p.gcloud_project,
         "GCLOUD_PROJECT": p.gcloud_project,
         "PROJECT_ID": p.gcloud_project,
         "PROJECT_NUMBER": p.gcloud_project_number,
@@ -572,13 +614,22 @@ class App(tk.Tk):
         ttk.Label(form, text="Profile name").grid(row=row, column=0, sticky="w")
         ttk.Entry(form, textvariable=self.var_name).grid(row=row, column=1, columnspan=2, sticky="ew"); row += 1
         ttk.Label(form, text="GOOGLE_API_KEY").grid(row=row, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.var_google, show="*").grid(row=row, column=1, columnspan=2, sticky="ew"); row += 1
+        google_key_frame = ttk.Frame(form)
+        google_key_frame.grid(row=row, column=1, columnspan=2, sticky="ew")
+        ttk.Entry(google_key_frame, textvariable=self.var_google, show="*").pack(side="left", fill="x", expand=True)
+        ttk.Button(google_key_frame, text="\u25B6", width=3, command=lambda: self.on_set_single_var("GOOGLE_API_KEY", self.var_google.get())).pack(side="left", padx=(4,0)); row += 1
         ttk.Label(form, text="GEMINI_API_KEY").grid(row=row, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.var_gemini, show="*").grid(row=row, column=1, columnspan=2, sticky="ew"); row += 1
+        gemini_key_frame = ttk.Frame(form)
+        gemini_key_frame.grid(row=row, column=1, columnspan=2, sticky="ew")
+        ttk.Entry(gemini_key_frame, textvariable=self.var_gemini, show="*").pack(side="left", fill="x", expand=True)
+        ttk.Button(gemini_key_frame, text="\u25B6", width=3, command=lambda: self.on_set_single_var("GEMINI_API_KEY", self.var_gemini.get())).pack(side="left", padx=(4,0)); row += 1
         ttk.Checkbutton(form, text="Keep both keys in sync (use GOOGLE_API_KEY for both)", variable=self.var_sync_keys,
                         command=self._sync_keys_now).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
         ttk.Label(form, text="gcloud project ID").grid(row=row, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.var_proj).grid(row=row, column=1, sticky="ew")
+        proj_frame = ttk.Frame(form)
+        proj_frame.grid(row=row, column=1, sticky="ew")
+        ttk.Entry(proj_frame, textvariable=self.var_proj).pack(side="left", fill="x", expand=True)
+        ttk.Button(proj_frame, text="\u25B6", width=3, command=lambda: self.on_set_single_var("GOOGLE_CLOUD_PROJECT", self.var_proj.get())).pack(side="left", padx=(4,0))
         ttk.Button(form, text="Resolve now", command=self.resolve_project_fields).grid(row=row, column=2, sticky="w"); row += 1
         ttk.Label(form, text="gcloud project number").grid(row=row, column=0, sticky="w")
         ttk.Entry(form, textvariable=self.var_projnum).grid(row=row, column=1, sticky="ew")
@@ -599,8 +650,7 @@ class App(tk.Tk):
 
         actions = ttk.Frame(form); actions.grid(row=row, column=0, columnspan=3, pady=8, sticky="ew")
         ttk.Button(actions, text="Save/Update", command=self.on_save).pack(side="left")
-        ttk.Button(actions, text="Apply", command=self.on_apply).pack(side="left", padx=8)
-        ttk.Button(actions, text="Remove and Apply", command=self.on_remove_and_apply).pack(side="left", padx=8)
+        ttk.Button(actions, text="Apply and Save", command=self.on_apply).pack(side="left", padx=8)
         ttk.Button(actions, text="Purge gcloud auth cache", command=self.on_purge).pack(side="left", padx=8)
         ttk.Button(actions, text="Open gcloud folder", command=self.on_open_gcloud_dir).pack(side="left", padx=8)
         ttk.Button(actions, text="Open profiles folder", command=self.on_open_profiles_dir).pack(side="left", padx=8)
@@ -661,17 +711,31 @@ class App(tk.Tk):
             self.store.delete(name); self.refresh_list(); self.on_new()
 
     def _collect_profile_from_form(self) -> Profile:
-        google = self.var_google.get(); gemini = self.var_gemini.get()
-        if self.var_sync_keys.get(): gemini = google; self.var_gemini.set(gemini)
         return Profile(
             name=self.var_name.get(),
-            google_api_key=google,
-            gemini_api_key=gemini,
+            google_api_key=self.var_google.get(),
+            gemini_api_key=self.var_gemini.get(),
             gcloud_project=self.var_proj.get(),
             gcloud_project_number=self.var_projnum.get(),
             gcloud_account=self.var_acct.get(),
             gcloud_service_account_key_file=self.var_key_file.get(),
         ).normalized()
+
+    def on_set_single_var(self, var_name: str, var_value: str):
+        self.txt.delete("1.0", tk.END)
+        self.txt.insert(tk.END, f"Applying single variable: {var_name}...\n\n"); self.update_idletasks()
+        use_machine_env = bool(self.var_machine.get())
+        def worker():
+            try:
+                logs = apply_single_variable(var_name, var_value, use_machine_env)
+                def update_gui():
+                    self.txt.insert(tk.END, logs + "\n\nDone. Open a NEW terminal to use the updated credentials.\n")
+                self.after(0, update_gui)
+            except Exception as e:
+                def update_gui_error():
+                    self.txt.insert(tk.END, "Error: " + str(e) + "\n")
+                self.after(0, update_gui_error)
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_save(self) -> None:
         try:
@@ -685,6 +749,7 @@ class App(tk.Tk):
             messagebox.showerror("Error", str(e))
 
     def on_apply(self) -> None:
+        self.on_save()
         try:
             p = self._collect_profile_from_form()
             if not p.name or not (p.google_api_key or p.gemini_api_key):
@@ -698,68 +763,43 @@ class App(tk.Tk):
             try:
                 logs = apply_profile(p, use_machine_env=use_machine_env, safe_revoke=safe_revoke, add_gcloud_to_path=add_to_path)
                 gp = gcloud_cmd_or_none()
-                self.txt.insert(tk.END, "gcloud exe: " + (gp or "(not found)") + "\n")
-                self.txt.insert(tk.END, "CLOUDSDK_CONFIG: " + str(gcloud_config_dir()) + "\n\n")
-                self.txt.insert(tk.END, logs + "\n\nDone. Open a NEW terminal to use the updated credentials.\n")
+                def update_gui():
+                    self.txt.insert(tk.END, "gcloud exe: " + (gp or "(not found)") + "\n")
+                    self.txt.insert(tk.END, "CLOUDSDK_CONFIG: " + str(gcloud_config_dir()) + "\n\n")
+                    self.txt.insert(tk.END, logs + "\n\nDone. Open a NEW terminal to use the updated credentials.\n")
+                self.after(0, update_gui)
             except Exception as e:
-                self.txt.insert(tk.END, "Error: " + str(e) + "\n")
+                def update_gui_error():
+                    self.txt.insert(tk.END, "Error: " + str(e) + "\n")
+                self.after(0, update_gui_error)
         threading.Thread(target=worker, daemon=True).start()
 
-    def on_remove_and_apply(self) -> None:
-        try:
-            p = self._collect_profile_from_form()
-            if not p.name or not (p.google_api_key or p.gemini_api_key):
-                raise ValueError("Profile name and at least one API key are required")
-        except Exception as e:
-            messagebox.showerror("Error", str(e)); return
 
-        self.txt.delete("1.0", tk.END)
-        self.txt.insert(tk.END, "Removing all credentials, then applying profile...\n\n")
-        self.update_idletasks()
 
-        use_machine_env = bool(self.var_machine.get())
-        add_to_path = bool(self.var_add_gcloud_to_path.get())
-
-        def worker():
-            try:
-                # Step 1: Purge gcloud auth
-                purge_logs = purge_gcloud_auth(account_hint=None, deep=True)
-                self.txt.insert(tk.END, "[Purge gcloud Auth]\n" + "\n".join(purge_logs) + "\n\n")
-
-                # Step 2: Clear environment variables
-                clear_logs = clear_environment_variables()
-                self.txt.insert(tk.END, "[Clear Environment Variables]\n" + "\n".join(clear_logs) + "\n\n")
-
-                # Step 3: Apply the new profile
-                self.txt.insert(tk.END, "[Apply Profile: " + p.name + "]\n")
-                apply_logs = apply_profile(p, use_machine_env=use_machine_env, safe_revoke=True, add_gcloud_to_path=add_to_path)
-                self.txt.insert(tk.END, apply_logs + "\n\nDone. Open a NEW terminal to use the updated credentials.\n")
-
-            except Exception as e:
-                self.txt.insert(tk.END, "\n\nError during remove and apply: " + str(e) + "\n")
-        threading.Thread(target=worker, daemon=True).start()
 
     def on_analyze(self) -> None:
         self.txt.delete("1.0", tk.END); self.txt.insert(tk.END, "Analyzing current setup...\n\n"); self.update_idletasks()
         def worker():
             prof, active_cfg, gp = analyze_current_setup()
-            self.var_name.set(prof.name); self.var_google.set(prof.google_api_key); self.var_gemini.set(prof.gemini_api_key)
-            self.var_proj.set(prof.gcloud_project); self.var_projnum.set(prof.gcloud_project_number); self.var_acct.set(prof.gcloud_account)
-            try: self.store.upsert(prof)
-            except Exception: pass
-            self.refresh_list()
-            try: idx = self.store.names().index(prof.name); self.lb.selection_set(idx); self._selected_name = prof.name
-            except Exception: pass
-            self.txt.insert(tk.END, "Detected GOOGLE_API_KEY: " + ("********" if prof.google_api_key else "(none)") + "\n")
-            self.txt.insert(tk.END, "Detected GEMINI_API_KEY: " + ("********" if prof.gemini_api_key else "(none)") + "\n")
-            if active_cfg: self.txt.insert(tk.END, "Active gcloud config: " + active_cfg + "\n")
-            self.txt.insert(tk.END, "gcloud exe: " + (gp or "(not found)") + "\n")
-            self.txt.insert(tk.END, "CLOUDSDK_CONFIG: " + str(gcloud_config_dir()) + "\n")
-            self.txt.insert(tk.END, "Active account: " + (prof.gcloud_account or "(unknown)") + "\n")
-            self.txt.insert(tk.END, "Active project ID: " + (prof.gcloud_project or "(unknown)") + "\n")
-            self.txt.insert(tk.END, "Active project number: " + (prof.gcloud_project_number or "(unknown)") + "\n")
-            self.txt.insert(tk.END, "\nProfiles: " + str(PROFILES_FILE) + "\nSettings: " + str(SETTINGS_FILE) + "\n")
-            self.txt.insert(tk.END, "gcloud config dir: " + str(gcloud_config_dir()) + "\n")
+            def update_gui():
+                self.var_name.set(prof.name); self.var_google.set(prof.google_api_key); self.var_gemini.set(prof.gemini_api_key)
+                self.var_proj.set(prof.gcloud_project); self.var_projnum.set(prof.gcloud_project_number); self.var_acct.set(prof.gcloud_account)
+                try: self.store.upsert(prof)
+                except Exception: pass
+                self.refresh_list()
+                try: idx = self.store.names().index(prof.name); self.lb.selection_set(idx); self._selected_name = prof.name
+                except Exception: pass
+                self.txt.insert(tk.END, "Detected GOOGLE_API_KEY: " + ("********" if prof.google_api_key else "(none)") + "\n")
+                self.txt.insert(tk.END, "Detected GEMINI_API_KEY: " + ("********" if prof.gemini_api_key else "(none)") + "\n")
+                if active_cfg: self.txt.insert(tk.END, "Active gcloud config: " + active_cfg + "\n")
+                self.txt.insert(tk.END, "gcloud exe: " + (gp or "(not found)") + "\n")
+                self.txt.insert(tk.END, "CLOUDSDK_CONFIG: " + str(gcloud_config_dir()) + "\n")
+                self.txt.insert(tk.END, "Active account: " + (prof.gcloud_account or "(unknown)") + "\n")
+                self.txt.insert(tk.END, "Active project ID: " + (prof.gcloud_project or "(unknown)") + "\n")
+                self.txt.insert(tk.END, "Active project number: " + (prof.gcloud_project_number or "(unknown)") + "\n")
+                self.txt.insert(tk.END, "\nProfiles: " + str(PROFILES_FILE) + "\nSettings: " + str(SETTINGS_FILE) + "\n")
+                self.txt.insert(tk.END, "gcloud config dir: " + str(gcloud_config_dir()) + "\n")
+            self.after(0, update_gui)
         threading.Thread(target=worker, daemon=True).start()
 
     def on_purge(self) -> None:
@@ -812,8 +852,10 @@ class App(tk.Tk):
             try:
                 target = pid if pid else pnum
                 rid, rnum = describe_project(target)
-                if rid and not pid: self.var_proj.set(rid)
-                if rnum and not pnum: self.var_projnum.set(rnum)
+                def update_gui():
+                    if rid and not pid: self.var_proj.set(rid)
+                    if rnum and not pnum: self.var_projnum.set(rnum)
+                self.after(0, update_gui)
             except Exception: pass
         threading.Thread(target=worker, daemon=True).start()
 
