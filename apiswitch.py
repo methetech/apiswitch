@@ -605,6 +605,7 @@ class App(tk.Tk):
 
         self.var_name = tk.StringVar(); self.var_google = tk.StringVar(); self.var_gemini = tk.StringVar()
         self.var_sync_keys = tk.BooleanVar(value=True)
+        self.var_show_keys = tk.BooleanVar(value=False)
         self.var_proj = tk.StringVar(); self.var_projnum = tk.StringVar(); self.var_acct = tk.StringVar()
         self.var_key_file = tk.StringVar()
         self.var_machine = tk.BooleanVar(value=False); self.var_safe = tk.BooleanVar(value=True)
@@ -616,15 +617,21 @@ class App(tk.Tk):
         ttk.Label(form, text="GOOGLE_API_KEY").grid(row=row, column=0, sticky="w")
         google_key_frame = ttk.Frame(form)
         google_key_frame.grid(row=row, column=1, columnspan=2, sticky="ew")
-        ttk.Entry(google_key_frame, textvariable=self.var_google, show="*").pack(side="left", fill="x", expand=True)
+        self.google_key_entry = ttk.Entry(google_key_frame, textvariable=self.var_google, show="*")
+        self.google_key_entry.pack(side="left", fill="x", expand=True)
         ttk.Button(google_key_frame, text="\u25B6", width=3, command=lambda: self.on_set_single_var("GOOGLE_API_KEY", self.var_google.get())).pack(side="left", padx=(4,0)); row += 1
         ttk.Label(form, text="GEMINI_API_KEY").grid(row=row, column=0, sticky="w")
         gemini_key_frame = ttk.Frame(form)
         gemini_key_frame.grid(row=row, column=1, columnspan=2, sticky="ew")
-        ttk.Entry(gemini_key_frame, textvariable=self.var_gemini, show="*").pack(side="left", fill="x", expand=True)
+        self.gemini_key_entry = ttk.Entry(gemini_key_frame, textvariable=self.var_gemini, show="*")
+        self.gemini_key_entry.pack(side="left", fill="x", expand=True)
         ttk.Button(gemini_key_frame, text="\u25B6", width=3, command=lambda: self.on_set_single_var("GEMINI_API_KEY", self.var_gemini.get())).pack(side="left", padx=(4,0)); row += 1
-        ttk.Checkbutton(form, text="Keep both keys in sync (use GOOGLE_API_KEY for both)", variable=self.var_sync_keys,
-                        command=self._sync_keys_now).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+        
+        key_opts_frame = ttk.Frame(form)
+        key_opts_frame.grid(row=row, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(key_opts_frame, text="Keep keys in sync", variable=self.var_sync_keys, command=self._sync_keys_now).pack(side="left", anchor="w")
+        ttk.Checkbutton(key_opts_frame, text="Show keys", variable=self.var_show_keys, command=self._toggle_key_visibility).pack(side="left", anchor="w", padx=12)
+        row += 1
         ttk.Label(form, text="gcloud project ID").grid(row=row, column=0, sticky="w")
         proj_frame = ttk.Frame(form)
         proj_frame.grid(row=row, column=1, sticky="ew")
@@ -678,6 +685,11 @@ class App(tk.Tk):
         )
         if path:
             self.var_key_file.set(path)
+
+    def _toggle_key_visibility(self):
+        show = "" if self.var_show_keys.get() else "*"
+        self.google_key_entry.config(show=show)
+        self.gemini_key_entry.config(show=show)
 
     def _sync_keys_now(self):
         if self.var_sync_keys.get(): self.var_gemini.set(self.var_google.get())
@@ -763,10 +775,28 @@ class App(tk.Tk):
             try:
                 logs = apply_profile(p, use_machine_env=use_machine_env, safe_revoke=safe_revoke, add_gcloud_to_path=add_to_path)
                 gp = gcloud_cmd_or_none()
+
+                # Write commands to a temporary file for the PowerShell wrapper to source
+                if is_windows():
+                    temp_dir = Path(os.environ.get("TEMP", str(Path.home() / "AppData" / "Local" / "Temp")))
+                    temp_file = temp_dir / "apiswitch_apply.ps1"
+                    commands = []
+                    if p.google_api_key: commands.append(f'$env:GOOGLE_API_KEY="{p.google_api_key}"')
+                    if p.gemini_api_key: commands.append(f'$env:GEMINI_API_KEY="{p.gemini_api_key}"')
+                    if p.gcloud_project: commands.append(f'$env:GOOGLE_CLOUD_PROJECT="{p.gcloud_project}"')
+                    # Also set the gcloud config for the wrapper's context if needed
+                    commands.append(f'$env:CLOUDSDK_CONFIG="{str(gcloud_config_dir())}"')
+                    temp_file.write_text("\n".join(commands), encoding="utf-8")
+
                 def update_gui():
                     self.txt.insert(tk.END, "gcloud exe: " + (gp or "(not found)") + "\n")
                     self.txt.insert(tk.END, "CLOUDSDK_CONFIG: " + str(gcloud_config_dir()) + "\n\n")
-                    self.txt.insert(tk.END, logs + "\n\nDone. Open a NEW terminal to use the updated credentials.\n")
+                    self.txt.insert(tk.END, logs + "\n\n")
+                    self.txt.insert(tk.END, "#"*80 + "\n")
+                    self.txt.insert(tk.END, "# Profile saved and ready to be applied.                             #\n")
+                    self.txt.insert(tk.END, "# Close this window to apply the settings to your current terminal. #\n")
+                    self.txt.insert(tk.END, "#"*80 + "\n")
+
                 self.after(0, update_gui)
             except Exception as e:
                 def update_gui_error():

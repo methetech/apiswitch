@@ -23,5 +23,20 @@ APISwitch is a profile switcher for Google/Gemini API keys and gcloud projects. 
 
 ## Configuration
 
+
+
 *   **Profiles**: `~/.apiswitch/profiles.json`
+
 *   **Settings**: `~/.apiswitch/settings.json`
+
+
+
+## Changelog
+
+
+
+### 2025-10-31
+
+
+
+*   Added a check to `apiswitch.ps1` to ensure it's run in a PowerShell terminal.
