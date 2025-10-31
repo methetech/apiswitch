@@ -734,9 +734,14 @@ class App(tk.Tk):
         ).normalized()
 
     def on_set_single_var(self, var_name: str, var_value: str):
+        use_machine_env = bool(self.var_machine.get())
+        if is_windows() and use_machine_env and not _is_admin_windows():
+            messagebox.showinfo("Admin Relaunch Required", f"Setting a machine-wide variable ('{var_name}') requires admin rights. The application will now attempt to relaunch as an administrator.")
+            relaunch_as_admin_if_needed()
+            return  # The original process will exit after this
+
         self.txt.delete("1.0", tk.END)
         self.txt.insert(tk.END, f"Applying single variable: {var_name}...\n\n"); self.update_idletasks()
-        use_machine_env = bool(self.var_machine.get())
         def worker():
             try:
                 logs = apply_single_variable(var_name, var_value, use_machine_env)
@@ -761,6 +766,12 @@ class App(tk.Tk):
             messagebox.showerror("Error", str(e))
 
     def on_apply(self) -> None:
+        use_machine_env = bool(self.var_machine.get())
+        if is_windows() and use_machine_env and not _is_admin_windows():
+            messagebox.showinfo("Admin Relaunch Required", "Applying a profile with machine-wide scope requires admin rights. The application will now attempt to relaunch as an administrator.")
+            relaunch_as_admin_if_needed()
+            return # The original process will exit after this
+
         self.on_save()
         try:
             p = self._collect_profile_from_form()
@@ -769,10 +780,29 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", str(e)); return
         self.txt.delete("1.0", tk.END); self.txt.insert(tk.END, "Applying profile...\n\n"); self.update_idletasks()
-        use_machine_env = bool(self.var_machine.get()); safe_revoke = bool(self.var_safe.get())
+        safe_revoke = bool(self.var_safe.get())
         add_to_path = bool(self.var_add_gcloud_to_path.get())
         def worker():
             try:
+                # This logic is duplicated from apply_profile to ensure the temp script is accurate
+                profile_for_apply = p.normalized()
+                if profile_for_apply.gcloud_project and not profile_for_apply.gcloud_project_number:
+                    _, pnum = describe_project(profile_for_apply.gcloud_project)
+                    if pnum: profile_for_apply.gcloud_project_number = pnum
+                elif profile_for_apply.gcloud_project_number and not profile_for_apply.gcloud_project:
+                    pid, _ = describe_project(profile_for_apply.gcloud_project_number)
+                    if pid: profile_for_apply.gcloud_project = pid
+
+                env_values = {
+                    "GOOGLE_API_KEY": profile_for_apply.google_api_key,
+                    "GEMINI_API_KEY": profile_for_apply.gemini_api_key,
+                    "GOOGLE_CLOUD_PROJECT": profile_for_apply.gcloud_project,
+                    "GOOGLE_CLOUD_PROJECT_ID": profile_for_apply.gcloud_project,
+                    "GCLOUD_PROJECT": profile_for_apply.gcloud_project,
+                    "PROJECT_ID": profile_for_apply.gcloud_project,
+                    "PROJECT_NUMBER": profile_for_apply.gcloud_project_number,
+                }
+
                 logs = apply_profile(p, use_machine_env=use_machine_env, safe_revoke=safe_revoke, add_gcloud_to_path=add_to_path)
                 gp = gcloud_cmd_or_none()
 
@@ -781,9 +811,9 @@ class App(tk.Tk):
                     temp_dir = Path(os.environ.get("TEMP", str(Path.home() / "AppData" / "Local" / "Temp")))
                     temp_file = temp_dir / "apiswitch_apply.ps1"
                     commands = []
-                    if p.google_api_key: commands.append(f'$env:GOOGLE_API_KEY="{p.google_api_key}"')
-                    if p.gemini_api_key: commands.append(f'$env:GEMINI_API_KEY="{p.gemini_api_key}"')
-                    if p.gcloud_project: commands.append(f'$env:GOOGLE_CLOUD_PROJECT="{p.gcloud_project}"')
+                    for var, val in env_values.items():
+                        if val:  # Only write variables that have a value
+                            commands.append(f'$env:{var}="{val}"')
                     # Also set the gcloud config for the wrapper's context if needed
                     commands.append(f'$env:CLOUDSDK_CONFIG="{str(gcloud_config_dir())}"')
                     temp_file.write_text("\n".join(commands), encoding="utf-8")
@@ -891,7 +921,6 @@ class App(tk.Tk):
 
 # ---------------------------- Main ----------------------------
 def main() -> None:
-    relaunch_as_admin_if_needed()
     store = ProfileStore(PROFILES_FILE)
     app = App(store)
     app.mainloop()
